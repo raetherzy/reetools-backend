@@ -121,24 +121,51 @@ async def get_user_id(username: str, client: httpx.AsyncClient, cookie_header: s
             if m:
                 uid = m.group(1)
                 _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} from JSON-LD (cached)")
+                print(f"[DEBUG] got user_id={uid} from identifier")
                 return uid
 
-            # Method 2: window.__INITIAL_STATE__ or window._sharedData
+            # Method 2: profilePage_USERID pattern
             m = re.search(r'"profilePage_(\d+)"', html)
             if m:
                 uid = m.group(1)
                 _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} from profilePage_ (cached)")
+                print(f"[DEBUG] got user_id={uid} from profilePage_")
                 return uid
 
-            # Method 3: props.id in embedded data
-            m = re.search(r'"props"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)"', html)
+            # Method 3: id near username in embedded JSON
+            m = re.search(r'"username"\s*:\s*"' + re.escape(username) + r'"[^}]*"id"\s*:\s*"(\d+)"', html)
             if m:
                 uid = m.group(1)
                 _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} from props.id (cached)")
+                print(f"[DEBUG] got user_id={uid} from username+id")
                 return uid
+
+            # Method 4: "pk":"USERID" near username
+            m = re.search(r'"username"\s*:\s*"' + re.escape(username) + r'"[^}]*"pk"\s*:\s*"?(\d+)"?', html)
+            if m:
+                uid = m.group(1)
+                _user_id_cache[username] = (uid, _time.time())
+                print(f"[DEBUG] got user_id={uid} from username+pk")
+                return uid
+
+            # Method 5: generic "id":"USERID" that looks like Instagram user ID (8+ digits)
+            for m in re.finditer(r'"id"\s*:\s*"(\d{8,})"', html):
+                uid = m.group(1)
+                # Verify this ID is near the target username
+                start = max(0, m.start() - 500)
+                end = min(len(html), m.end() + 500)
+                context = html[start:end]
+                if username in context:
+                    _user_id_cache[username] = (uid, _time.time())
+                    print(f"[DEBUG] got user_id={uid} from id near username")
+                    return uid
+
+            # Debug: dump sample around username mentions
+            for m in re.finditer(re.escape(username), html):
+                start = max(0, m.start() - 200)
+                end = min(len(html), m.end() + 200)
+                print(f"[DEBUG] context near username: ...{html[start:end]}...")
+                break  # just first match
 
             print(f"[DEBUG] user_id not found in HTML (len={len(html)})")
 
