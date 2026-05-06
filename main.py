@@ -52,11 +52,12 @@ def clean_story_url(url: str) -> str:
 
 def extract_info(url: str) -> dict:
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
         "extract_flat": False,
         "noplaylist": False,
         "playlist_items": "1-100",
+        "playlistend": 0,
         "cookiefile": COOKIE_FILE,
     }
 
@@ -100,13 +101,18 @@ def get_media_url(entry: dict) -> str:
 
 def parse_response(info: dict) -> dict:
     entries = info.get("entries")
+    print(f"[DEBUG] entries count: {len(entries) if entries else 0}")
+    print(f"[DEBUG] info keys: {list(info.keys())}")
+
     if entries:
         items = []
-        for entry in entries:
+        for i, entry in enumerate(entries):
             video = is_video_media(entry)
+            url = get_media_url(entry)
+            print(f"[DEBUG] entry[{i}]: type={'video' if video else 'photo'}, url={url[:80]}...")
             items.append({
                 "type": "video" if video else "photo",
-                "url": get_media_url(entry),
+                "url": url,
                 "thumbnail": entry.get("thumbnail", ""),
             })
 
