@@ -22,8 +22,8 @@ COOKIE_FILE = os.environ.get("COOKIE_FILE", "instagram_cookies.txt")
 async def startup():
     cookies = os.environ.get("INSTAGRAM_COOKIES", "")
     if cookies:
-        with open(COOKIE_FILE, "w") as f:
-            f.write(cookies.replace("\\n", "\n"))
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            f.write(cookies.strip() + "\n")
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
