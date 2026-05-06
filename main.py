@@ -210,84 +210,97 @@ def clean_story_url(url: str) -> str:
     return url
 
 
-async def extract_stories(url: str) -> dict:
-    """Extract Instagram stories — HTML page scrape primary, yt-dlp fallback"""
+def extract_stories(url: str) -> dict:
+    """Extract ALL stories — yt-dlp flat playlist lalu resolve satu per satu"""
     username = extract_username_from_url(url)
-    print(f"[INFO] Scraping HTML page untuk @{username}...")
+    print(f"[INFO] Extract stories untuk @{username}...")
+
+    ydl_opts_flat = {
+        "quiet": False,
+        "no_warnings": False,
+        "extract_flat": "in_playlist",
+        "noplaylist": False,
+        "cookiefile": COOKIE_FILE,
+        "ignoreerrors": True,
+        "sleep_interval": 2,
+        "max_sleep_interval": 5,
+    }
 
     try:
-        return await extract_stories_from_page(username)
-    except HTTPException:
-        raise
+        with yt_dlp.YoutubeDL(ydl_opts_flat) as ydl:
+            info = ydl.extract_info(url, download=False)
     except Exception as e:
-        print(f"[WARN] HTML scrape gagal: {e}, fallback ke yt-dlp...")
+        raise HTTPException(status_code=400, detail=f"Gagal extract playlist: {str(e)}")
 
-    strategies = [
-        {
-            "extract_flat": "in_playlist",
-            "ignoreerrors": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "sleep_interval": 1,
-            "max_sleep_interval": 3,
-        },
-        {
-            "extract_flat": False,
-            "ignoreerrors": True,
-            "retries": 10,
-            "fragment_retries": 10,
-            "sleep_interval": 2,
-            "max_sleep_interval": 5,
-        }
-    ]
+    flat_entries = info.get("entries") or []
+    print(f"[INFO] Flat playlist: {len(flat_entries)} entries")
 
-    last_result = None
-    for i, extra_opts in enumerate(strategies):
-        ydl_opts = {
-            "quiet": False,
-            "no_warnings": False,
-            "noplaylist": False,
-            "cookiefile": COOKIE_FILE,
-            **extra_opts
-        }
+    if not flat_entries:
+        raise HTTPException(status_code=404, detail="Tidak ada story ditemukan.")
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+    items = []
+    ydl_opts_resolve = {
+        "quiet": False,
+        "no_warnings": False,
+        "extract_flat": False,
+        "noplaylist": True,
+        "cookiefile": COOKIE_FILE,
+        "ignoreerrors": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "sleep_interval": 1.5,
+        "max_sleep_interval": 4,
+    }
 
-                if info.get("entries"):
-                    resolved_entries = []
-                    for entry in info["entries"]:
-                        if entry.get("url") and entry["url"].startswith("http"):
-                            resolved_entries.append(entry)
-                        else:
-                            entry_url = entry.get("webpage_url") or entry.get("url", "")
-                            if entry_url:
-                                try:
-                                    resolved = ydl.extract_info(entry_url, download=False)
-                                    resolved_entries.append(resolved)
-                                except Exception as e:
-                                    print(f"[WARN] Strategi {i+1}, gagal resolve entry: {e}")
-                                    continue
-
-                    info["entries"] = resolved_entries
-
-                result = parse_story_response(info)
-                print(f"[INFO] Strategi {i+1} berhasil: {len(result['items'])} item")
-
-                if last_result is None or len(result["items"]) > len(last_result["items"]):
-                    last_result = result
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            print(f"[WARN] Strategi {i+1} gagal: {e}")
+    import time
+    for i, entry in enumerate(flat_entries):
+        entry_url = entry.get("url") or entry.get("webpage_url") or ""
+        if not entry_url:
+            print(f"[WARN] entry[{i}] tidak punya URL, skip")
             continue
 
-    if last_result:
-        return last_result
+        print(f"[INFO] Resolving {i+1}/{len(flat_entries)}: {entry_url[:80]}...")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts_resolve) as ydl:
+                resolved = ydl.extract_info(entry_url, download=False)
 
-    raise HTTPException(status_code=400, detail="Gagal memproses semua strategi")
+            media_url = resolved.get("url", "")
+            if not media_url or not media_url.startswith("http"):
+                media_url = resolved.get("requested_downloads", [{}])[0].get("url", "")
+
+            if not media_url or not media_url.startswith("http"):
+                print(f"[WARN] entry[{i}] resolved tapi URL kosong, skip")
+                continue
+
+            is_video = False
+            if resolved.get("vcodec") and resolved["vcodec"] != "none":
+                is_video = True
+            elif resolved.get("duration"):
+                is_video = True
+            elif ".mp4" in media_url.lower():
+                is_video = True
+
+            items.append({
+                "type": "video" if is_video else "photo",
+                "url": media_url,
+                "thumbnail": resolved.get("thumbnail", ""),
+            })
+            print(f"[DEBUG] resolved entry[{i}]: {'video' if is_video else 'photo'}, url={media_url[:80]}")
+
+        except Exception as e:
+            print(f"[WARN] entry[{i}] gagal resolve: {e}")
+
+        time.sleep(1)
+
+    if not items:
+        raise HTTPException(status_code=404, detail="Semua entry gagal di-resolve.")
+
+    return {
+        "type": "carousel",
+        "items": items,
+        "description": info.get("title") or f"Story by {username}",
+        "author": info.get("uploader") or info.get("channel") or username,
+    }
 
 
 def extract_username_from_url(url: str) -> str:
@@ -347,11 +360,11 @@ def parse_story_response(info: dict) -> dict:
 # ===== Routes =====
 
 @app.get("/instagram/story")
-async def get_story(url: str = Query(..., description="Instagram story URL")):
+def get_story(url: str = Query(..., description="Instagram story URL")):
     clean_url = clean_story_url(url)
     print(f"[DEBUG] story request: {url} -> {clean_url}")
     try:
-        return JSONResponse(await extract_stories(clean_url))
+        return JSONResponse(extract_stories(clean_url))
     except HTTPException:
         raise
     except Exception as e:
@@ -417,11 +430,12 @@ async def get_highlight(url: str = Query(..., description="Instagram highlight U
 
 @app.get("/instagram/story/debug")
 async def debug_story(username: str = Query(..., description="Instagram username")):
-    """Endpoint debug — scrape HTML page dan tampilkan hasil"""
+    """Endpoint debug — gunakan yt-dlp flat + resolve satu per satu"""
     try:
-        result = await extract_stories_from_page(username)
+        url = f"https://www.instagram.com/stories/{username}/"
+        result = extract_stories(url)
         return {
-            "method": "html_scrape",
+            "method": "ytdlp_flat_then_resolve",
             "total_items": len(result["items"]),
             "items": [
                 {"index": i, "type": it["type"], "url_preview": it["url"][:80]}
@@ -429,9 +443,9 @@ async def debug_story(username: str = Query(..., description="Instagram username
             ],
         }
     except HTTPException as e:
-        return JSONResponse({"error": e.detail, "method": "html_scrape"}, status_code=e.status_code)
+        return JSONResponse({"error": e.detail, "method": "ytdlp_flat_then_resolve"}, status_code=e.status_code)
     except Exception as e:
-        return JSONResponse({"error": str(e), "method": "html_scrape"}, status_code=500)
+        return JSONResponse({"error": str(e), "method": "ytdlp_flat_then_resolve"}, status_code=500)
 
 
 @app.get("/instagram/stream")
