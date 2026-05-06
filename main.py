@@ -21,6 +21,10 @@ app.add_middleware(
 
 COOKIE_FILE = os.environ.get("COOKIE_FILE", "instagram_cookies.txt")
 
+# Simple in-memory cache for username -> user_id
+import time as _time
+_user_id_cache: dict[str, tuple[str, float]] = {}  # username -> (user_id, timestamp)
+
 @app.on_event("startup")
 async def startup():
     cookies_b64 = os.environ.get("INSTAGRAM_COOKIES_B64", "")
@@ -82,25 +86,57 @@ def extract_username(url: str) -> str:
 
 
 async def get_user_id(username: str, client: httpx.AsyncClient, cookie_header: str) -> Optional[str]:
-    """Get Instagram numeric user ID from username"""
-    try:
-        headers = {**IG_API_HEADERS, "Cookie": cookie_header}
-        resp = await client.get(
-            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
-            headers=headers,
-        )
-        print(f"[DEBUG] get_user_id status={resp.status_code}")
-        if resp.status_code != 200:
-            print(f"[DEBUG] get_user_id body: {resp.text[:300]}")
-            return None
-        data = resp.json()
-        user = data.get("data", {}).get("user", {})
-        uid = str(user.get("pk") or user.get("id", ""))
-        print(f"[DEBUG] got user_id={uid}")
-        return uid or None
-    except Exception as e:
-        print(f"get_user_id error: {e}")
-        return None
+    """Get Instagram numeric user ID from username (with cache + retry)"""
+    # Check cache (5 min TTL)
+    if username in _user_id_cache:
+        uid, ts = _user_id_cache[username]
+        if _time.time() - ts < 300:
+            print(f"[DEBUG] cache hit: {username} -> {uid}")
+            return uid
+
+    headers = {**IG_API_HEADERS, "Cookie": cookie_header}
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = await client.get(
+                f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+                headers=headers,
+            )
+            status = resp.status_code
+            print(f"[DEBUG] get_user_id status={status} attempt={attempt+1}")
+
+            if status == 429:
+                wait = (attempt + 1) * 5
+                print(f"[DEBUG] rate limited, waiting {wait}s...")
+                await _asleep(wait)
+                continue
+
+            if status != 200:
+                print(f"[DEBUG] get_user_id body: {resp.text[:300]}")
+                return None
+
+            data = resp.json()
+            user = data.get("data", {}).get("user", {})
+            uid = str(user.get("pk") or user.get("id", ""))
+            if uid:
+                _user_id_cache[username] = (uid, _time.time())
+                print(f"[DEBUG] got user_id={uid} (cached)")
+            return uid or None
+
+        except Exception as e:
+            print(f"get_user_id error: {e}")
+            if attempt < max_retries - 1:
+                await _asleep(2)
+            else:
+                return None
+
+    return None
+
+
+async def _asleep(seconds: float):
+    import asyncio
+    await asyncio.sleep(seconds)
 
 
 async def extract_stories_direct(url: str) -> dict:
@@ -120,11 +156,19 @@ async def extract_stories_direct(url: str) -> dict:
 
         print(f"[DEBUG] username={username}, user_id={user_id}")
 
-        # Step 2: Get all stories via reels_media API
-        resp = await client.get(
-            f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
-            headers=headers,
-        )
+        # Step 2: Get all stories via reels_media API (with retry)
+        for attempt in range(3):
+            resp = await client.get(
+                f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
+                headers=headers,
+            )
+            if resp.status_code == 429:
+                wait = (attempt + 1) * 5
+                print(f"[DEBUG] reels_media rate limited, waiting {wait}s...")
+                await _asleep(wait)
+                continue
+            break
+
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=resp.status_code,
