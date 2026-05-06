@@ -43,6 +43,7 @@ def extract_info(url: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
+        "noplaylist": False,
         "cookiefile": COOKIE_FILE,
     }
 
@@ -56,16 +57,43 @@ def extract_info(url: str) -> dict:
         )
 
 
+def is_video_media(entry: dict) -> bool:
+    # Multiple ways to detect video
+    if entry.get("vcodec") and entry["vcodec"] != "none":
+        return True
+    if entry.get("acodec") and entry["acodec"] != "none":
+        return True
+    ext = entry.get("ext", "")
+    if ext in ("mp4", "webm", "mov"):
+        return True
+    if entry.get("duration"):
+        return True
+    url = entry.get("url", "")
+    if ".mp4" in url or "video" in url.lower():
+        return True
+    fmt = entry.get("format", "")
+    if fmt and "video" in fmt:
+        return True
+    return False
+
+def get_media_url(entry: dict) -> str:
+    # Prefer direct CDN URL, fallback to webpage_url
+    url = entry.get("url", "")
+    if url and ("cdninstagram" in url or "fbcdn" in url or "video" in url.lower() or ".mp4" in url or ".jpg" in url):
+        return url
+    if url and url.startswith("http"):
+        return url
+    return entry.get("webpage_url", "")
+
 def parse_response(info: dict) -> dict:
-    # Handle playlist (multiple entries = carousel/highlight)
     entries = info.get("entries")
     if entries:
         items = []
         for entry in entries:
-            is_video = entry.get("vcodec") not in ("none", None) or entry.get("acodec") not in ("none", None)
+            video = is_video_media(entry)
             items.append({
-                "type": "video" if is_video else "photo",
-                "url": entry.get("url") or entry.get("webpage_url", ""),
+                "type": "video" if video else "photo",
+                "url": get_media_url(entry),
                 "thumbnail": entry.get("thumbnail", ""),
             })
 
@@ -76,17 +104,16 @@ def parse_response(info: dict) -> dict:
             "author": info.get("uploader") or info.get("channel", ""),
         }
 
-        # For highlights, include the title
         if info.get("title"):
             result["title"] = info.get("title")
         return result
 
     # Single media
-    is_video = info.get("vcodec") not in ("none", None) or info.get("acodec") not in ("none", None)
+    video = is_video_media(info)
 
     result = {
-        "type": "video" if is_video else "photo",
-        "url": info.get("url") or info.get("webpage_url", ""),
+        "type": "video" if video else "photo",
+        "url": get_media_url(info),
         "thumbnail": info.get("thumbnail", ""),
         "description": info.get("description") or info.get("title", ""),
         "author": info.get("uploader") or info.get("channel", ""),
