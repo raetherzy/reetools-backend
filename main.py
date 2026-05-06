@@ -1,4 +1,5 @@
 import os
+import base64
 import yt_dlp
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -20,10 +21,14 @@ COOKIE_FILE = os.environ.get("COOKIE_FILE", "instagram_cookies.txt")
 
 @app.on_event("startup")
 async def startup():
-    cookies = os.environ.get("INSTAGRAM_COOKIES", "")
-    if cookies:
-        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-            f.write(cookies.strip() + "\n")
+    cookies_b64 = os.environ.get("INSTAGRAM_COOKIES_B64", "")
+    if cookies_b64:
+        try:
+            cookies = base64.b64decode(cookies_b64).decode("utf-8")
+            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                f.write(cookies.strip() + "\n")
+        except Exception as e:
+            print(f"Failed to decode cookies: {e}")
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
