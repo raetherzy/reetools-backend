@@ -126,7 +126,13 @@ def extract_stories_ytdlp(url: str) -> list:
         "quiet": True, "no_warnings": True,
         "extract_flat": "in_playlist", "noplaylist": False,
         "cookiefile": COOKIE_FILE, "ignoreerrors": True,
+        "playlistend": 999, "playlist_items": "1:999",
         "sleep_interval": 2, "max_sleep_interval": 5,
+        "extractor_args": {
+            "instagram": {
+                "include_stories": True,
+            }
+        },
     }
     with yt_dlp.YoutubeDL(flat_opts) as ydl:
         info = ydl.extract_info(url, download=False)
