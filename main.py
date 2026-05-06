@@ -6,7 +6,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import Optional
 
 app = FastAPI(title="ReeTools Instagram Backend")
@@ -38,6 +37,158 @@ BROWSER_HEADERS = {
     "Accept": "*/*",
 }
 
+IG_APP_HEADERS = {
+    "User-Agent": "Instagram 219.0.0.12.117 Android",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-IG-App-ID": "936619743392459",
+}
+
+
+def parse_netscape_cookies(filepath: str) -> dict:
+    """Parse Netscape cookie file into dict of {name: value}"""
+    cookies = {}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        print(f"[WARN] Cookie file not found: {filepath}")
+        return cookies
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            name, value = parts[5], parts[6]
+            cookies[name] = value
+            continue
+
+    if not cookies:
+        for line in content.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for pair in line.split(";"):
+                pair = pair.strip()
+                if "=" in pair:
+                    key, val = pair.split("=", 1)
+                    cookies[key.strip()] = val.strip().strip('"')
+
+    return cookies
+
+
+def get_ig_api_headers(filepath: str = None) -> dict:
+    """Build headers for Instagram internal API requests"""
+    if filepath is None:
+        filepath = COOKIE_FILE
+    c = parse_netscape_cookies(filepath)
+    csrftoken = c.get("csrftoken", "")
+    sessionid = c.get("sessionid", "")
+    ds_user_id = c.get("ds_user_id", "")
+
+    cookie_str = f"sessionid={sessionid}; csrftoken={csrftoken}; ds_user_id={ds_user_id}"
+    headers = dict(IG_APP_HEADERS)
+    headers["X-CSRFToken"] = csrftoken
+    headers["Cookie"] = cookie_str
+    return headers
+
+
+async def get_instagram_user_id(username: str) -> str:
+    """Get Instagram user ID from username via internal API"""
+    url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    headers = get_ig_api_headers()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            raise Exception(f"Gagal ambil user info: HTTP {resp.status_code}")
+        data = resp.json()
+        user = data.get("data", {}).get("user")
+        if not user:
+            raise Exception("User tidak ditemukan")
+        return str(user["id"])
+
+
+async def extract_stories_direct(username: str) -> dict:
+    """Extract ALL stories using Instagram internal API directly"""
+    headers = get_ig_api_headers()
+    user_id = await get_instagram_user_id(username)
+
+    url = f"https://i.instagram.com/api/v1/feed/user/{user_id}/story/"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Tidak ada story ditemukan.")
+        if resp.status_code != 200:
+            raise Exception(f"Gagal ambil story: HTTP {resp.status_code}")
+        data = resp.json()
+
+    reel = data.get("reel") or data.get("reels", {}).get(user_id)
+    if not reel:
+        raise HTTPException(status_code=404, detail="Tidak ada story ditemukan.")
+
+    items_raw = reel.get("items", [])
+    print(f"[INFO] Direct API: {len(items_raw)} story items dari Instagram")
+
+    items = []
+    for i, item in enumerate(items_raw):
+        media_type = item.get("media_type", 1)
+        is_video = media_type == 2
+        entries = []
+
+        if media_type == 8:
+            subs = item.get("carousel_media", [])
+            for sub in subs:
+                entries.append({
+                    "is_video": sub.get("media_type") == 2,
+                    "images": sub.get("image_versions2", {}).get("candidates", []),
+                    "videos": sub.get("video_versions", []),
+                })
+        else:
+            entries.append({
+                "is_video": is_video,
+                "images": item.get("image_versions2", {}).get("candidates", []),
+                "videos": item.get("video_versions", []),
+            })
+
+        for ei, entry in enumerate(entries):
+            if entry["is_video"]:
+                videos = entry["videos"]
+                url = videos[0]["url"] if videos else ""
+            else:
+                images = entry["images"]
+                url = images[0]["url"] if images else ""
+
+            if not url or not url.startswith("http"):
+                idx = f"{i}.{ei}" if len(entries) > 1 else str(i)
+                print(f"[WARN] Direct API item[{idx}] URL tidak valid, skip")
+                continue
+
+            thumb = ""
+            if entry["is_video"] and images:
+                thumb = images[0]["url"]
+            elif not entry["is_video"]:
+                thumb = url
+
+            items.append({
+                "type": "video" if entry["is_video"] else "photo",
+                "url": url,
+                "thumbnail": thumb,
+            })
+            idx = f"{i}.{ei}" if len(entries) > 1 else str(i)
+            print(f"[DEBUG]   item[{idx}]: {'video' if entry['is_video'] else 'photo'}, url={url[:80]}...")
+
+    if not items:
+        raise HTTPException(status_code=404, detail="Semua entry tidak valid.")
+
+    return {
+        "type": "carousel",
+        "items": items,
+        "description": f"Story by {username}",
+        "author": username,
+    }
+
 
 def clean_story_url(url: str) -> str:
     match = re.match(
@@ -48,8 +199,18 @@ def clean_story_url(url: str) -> str:
     return url
 
 
-def extract_stories(url: str) -> dict:
-    """Extract Instagram stories using yt-dlp with fallback strategies"""
+async def extract_stories(url: str) -> dict:
+    """Extract Instagram stories — direct API first, yt-dlp as fallback"""
+    username = extract_username_from_url(url)
+    print(f"[INFO] Mencoba direct API untuk @{username}...")
+
+    try:
+        return await extract_stories_direct(username)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WARN] Direct API gagal: {e}, fallback ke yt-dlp...")
+
     strategies = [
         {
             "extract_flat": "in_playlist",
@@ -118,6 +279,14 @@ def extract_stories(url: str) -> dict:
     raise HTTPException(status_code=400, detail="Gagal memproses semua strategi")
 
 
+def extract_username_from_url(url: str) -> str:
+    """Extract username from Instagram story URL"""
+    match = re.search(r"instagram\.com/stories/([\w.]+)", url)
+    if match:
+        return match.group(1)
+    raise HTTPException(status_code=400, detail="Tidak bisa extract username dari URL")
+
+
 def parse_story_response(info: dict) -> dict:
     entries = info.get("entries")
     playlist_count = info.get("playlist_count", 0)
@@ -171,7 +340,7 @@ async def get_story(url: str = Query(..., description="Instagram story URL")):
     clean_url = clean_story_url(url)
     print(f"[DEBUG] story request: {url} -> {clean_url}")
     try:
-        return JSONResponse(extract_stories(clean_url))
+        return JSONResponse(await extract_stories(clean_url))
     except HTTPException:
         raise
     except Exception as e:
