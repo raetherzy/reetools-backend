@@ -1,6 +1,7 @@
 import os
 import base64
 import re
+import json
 import yt_dlp
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -38,11 +39,134 @@ BROWSER_HEADERS = {
     "Accept": "*/*",
 }
 
+IG_API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "X-IG-App-ID": "9366197433924594",
+    "X-ASBD-ID": "198387",
+    "X-IG-WWW-Claim": "0",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def parse_netscape_cookies() -> dict:
+    """Parse Netscape cookie file into a dict of {name: value}"""
+    cookies = {}
+    try:
+        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookies[parts[5]] = parts[6]
+    except Exception as e:
+        print(f"Cookie parse error: {e}")
+    return cookies
+
+
+def get_cookie_header() -> str:
+    c = parse_netscape_cookies()
+    return f"sessionid={c.get('sessionid', '')}; csrftoken={c.get('csrftoken', '')}; ds_user_id={c.get('ds_user_id', '')}"
+
+
+def extract_username(url: str) -> str:
+    match = re.search(r"instagram\.com/stories/([\w.]+)", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"instagram\.com/stories/highlights/(\d+)", url)
+    if match:
+        return ""  # highlight uses numeric ID
+    return ""
+
+
+async def get_user_id(username: str, client: httpx.AsyncClient) -> Optional[str]:
+    """Get Instagram numeric user ID from username"""
+    try:
+        resp = await client.get(
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+            headers=IG_API_HEADERS,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        user = data.get("data", {}).get("user", {})
+        return str(user.get("pk") or user.get("id", ""))
+    except Exception as e:
+        print(f"get_user_id error: {e}")
+        return None
+
+
+async def extract_stories_direct(url: str) -> dict:
+    """Call Instagram's reels_media API directly to get ALL stories"""
+    username = extract_username(url)
+    if not username:
+        raise HTTPException(status_code=400, detail="Username tidak ditemukan di URL")
+
+    cookie_header = get_cookie_header()
+    headers = {**IG_API_HEADERS, "Cookie": cookie_header}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Step 1: Get user ID
+        user_id = await get_user_id(username, client)
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Gagal mendapatkan user ID. Pastikan cookies valid.")
+
+        print(f"[DEBUG] username={username}, user_id={user_id}")
+
+        # Step 2: Get all stories via reels_media API
+        resp = await client.get(
+            f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Instagram API error ({resp.status_code}): {resp.text[:200]}",
+            )
+
+        data = resp.json()
+        reels = data.get("reels", {})
+        reel = reels.get(user_id, {})
+        items_raw = reel.get("items", [])
+
+        print(f"[DEBUG] direct API: got {len(items_raw)} story items")
+
+        items = []
+        for item in items_raw:
+            media_type = item.get("media_type", 1)  # 1=photo, 2=video
+            is_video = media_type == 2
+
+            if is_video:
+                video_versions = item.get("video_versions", [])
+                url = video_versions[0]["url"] if video_versions else ""
+                thumbnail = item.get("image_versions2", {}).get("candidates", [{}])[0].get("url", "")
+            else:
+                image_versions = item.get("image_versions2", {}).get("candidates", [])
+                url = image_versions[0]["url"] if image_versions else ""
+                thumbnail = url
+
+            items.append({
+                "type": "video" if is_video else "photo",
+                "url": url,
+                "thumbnail": thumbnail,
+            })
+
+        if not items:
+            raise HTTPException(status_code=404, detail="Tidak ada story ditemukan. Mungkin sudah expired.")
+
+        return {
+            "type": "carousel",
+            "items": items,
+            "description": f"Story by {username}",
+            "author": username,
+        }
+
+
+# ===== yt-dlp fallback (for non-story content) =====
 
 def clean_story_url(url: str) -> str:
-    # Convert specific story URL to base stories URL to get ALL stories
-    # From: /stories/username/123456789/
-    # To:   /stories/username/
     match = re.match(
         r"(https?://(?:www\.)?instagram\.com/stories/[\w.]+)/\d+", url
     )
@@ -50,21 +174,18 @@ def clean_story_url(url: str) -> str:
         return match.group(1) + "/"
     return url
 
+
 def extract_info(url: str) -> dict:
     ydl_opts = {
-        "quiet": False,
-        "no_warnings": False,
+        "quiet": True,
+        "no_warnings": True,
         "extract_flat": False,
         "noplaylist": False,
-        "playlist_items": "1-100",
-        "playlistend": 0,
         "cookiefile": COOKIE_FILE,
     }
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info
+            return ydl.extract_info(url, download=False)
     except Exception as e:
         raise HTTPException(
             status_code=400, detail=f"Gagal memproses URL: {str(e)}"
@@ -72,7 +193,6 @@ def extract_info(url: str) -> dict:
 
 
 def is_video_media(entry: dict) -> bool:
-    # Multiple ways to detect video
     if entry.get("vcodec") and entry["vcodec"] != "none":
         return True
     if entry.get("acodec") and entry["acodec"] != "none":
@@ -85,51 +205,40 @@ def is_video_media(entry: dict) -> bool:
     url = entry.get("url", "")
     if ".mp4" in url or "video" in url.lower():
         return True
-    fmt = entry.get("format", "")
-    if fmt and "video" in fmt:
-        return True
     return False
 
+
 def get_media_url(entry: dict) -> str:
-    # Prefer direct CDN URL, fallback to webpage_url
     url = entry.get("url", "")
-    if url and ("cdninstagram" in url or "fbcdn" in url or "video" in url.lower() or ".mp4" in url or ".jpg" in url):
+    if url and ("cdninstagram" in url or "fbcdn" in url):
         return url
     if url and url.startswith("http"):
         return url
     return entry.get("webpage_url", "")
 
+
 def parse_response(info: dict) -> dict:
     entries = info.get("entries")
-    print(f"[DEBUG] entries count: {len(entries) if entries else 0}")
-    print(f"[DEBUG] info keys: {list(info.keys())}")
-
     if entries:
         items = []
-        for i, entry in enumerate(entries):
+        for entry in entries:
             video = is_video_media(entry)
-            url = get_media_url(entry)
-            print(f"[DEBUG] entry[{i}]: type={'video' if video else 'photo'}, url={url[:80]}...")
             items.append({
                 "type": "video" if video else "photo",
-                "url": url,
+                "url": get_media_url(entry),
                 "thumbnail": entry.get("thumbnail", ""),
             })
-
         result = {
             "type": "carousel",
             "items": items,
             "description": info.get("title") or info.get("description", ""),
             "author": info.get("uploader") or info.get("channel", ""),
         }
-
         if info.get("title"):
             result["title"] = info.get("title")
         return result
 
-    # Single media
     video = is_video_media(info)
-
     result = {
         "type": "video" if video else "photo",
         "url": get_media_url(info),
@@ -137,23 +246,31 @@ def parse_response(info: dict) -> dict:
         "description": info.get("description") or info.get("title", ""),
         "author": info.get("uploader") or info.get("channel", ""),
     }
-
     if info.get("title"):
         result["title"] = info.get("title")
-
     return result
 
+
+# ===== Routes =====
 
 @app.get("/instagram/story")
 async def get_story(url: str = Query(..., description="Instagram story URL")):
     try:
-        clean_url = clean_story_url(url)
-        info = extract_info(clean_url)
-        return JSONResponse(parse_response(info))
+        # Try direct API first (more reliable, gets ALL stories)
+        return JSONResponse(await extract_stories_direct(url))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Direct API failed, falling back to yt-dlp: {e}")
+        # Fallback to yt-dlp
+        try:
+            clean_url = clean_story_url(url)
+            info = extract_info(clean_url)
+            return JSONResponse(parse_response(info))
+        except HTTPException:
+            raise
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=str(e2))
 
 
 @app.get("/instagram/highlight")
@@ -178,25 +295,18 @@ async def stream_media(
     async def streamer():
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream(
-                "GET",
-                url,
-                headers=BROWSER_HEADERS,
-                follow_redirects=True,
+                "GET", url, headers=BROWSER_HEADERS, follow_redirects=True,
             ) as r:
                 async for chunk in r.aiter_bytes(8192):
                     yield chunk
 
     content_type = "video/mp4" if type == "video" else "image/jpeg"
-    headers = {}
+    resp_headers = {}
     if download:
         ext = "mp4" if type == "video" else "jpg"
-        headers["Content-Disposition"] = f'attachment; filename="{filename}.{ext}"'
+        resp_headers["Content-Disposition"] = f'attachment; filename="{filename}.{ext}"'
 
-    return StreamingResponse(
-        streamer(),
-        media_type=content_type,
-        headers=headers,
-    )
+    return StreamingResponse(streamer(), media_type=content_type, headers=resp_headers)
 
 
 @app.get("/health")
