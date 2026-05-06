@@ -189,18 +189,35 @@ def extract_username_from_url(url: str) -> str:
     raise HTTPException(status_code=400, detail="Tidak bisa extract username dari URL")
 
 @app.get("/instagram/story")
-def get_story(url: str = Query(..., description="Instagram story URL")):
+async def get_story(url: str = Query(..., description="Instagram story URL")):
     clean_url = clean_story_url(url)
     username = extract_username_from_url(clean_url)
     print(f"[INFO] Story request for @{username}")
 
     items = []
+
+    # ── Strategy 1: Direct Instagram API (seperti contoh) ──
+    try:
+        items = await extract_stories_direct(username)
+        print(f"[INFO] Direct API success: {len(items)} items")
+        return JSONResponse({
+            "type": "carousel",
+            "items": items,
+            "description": f"Story by {username}",
+            "author": username,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WARN] Direct API gagal: {e}, fallback ke yt-dlp...")
+
+    # ── Strategy 2: yt-dlp flat+resolve ──
     try:
         items = extract_stories_ytdlp(clean_url)
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] yt-dlp gagal: {e}")
+        print(f"[ERROR] yt-dlp juga gagal: {e}")
 
     if not items:
         raise HTTPException(status_code=404, detail="Tidak ada story ditemukan")
