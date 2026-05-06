@@ -1,6 +1,7 @@
 import os
 import base64
 import re
+import asyncio
 import yt_dlp
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -104,12 +105,31 @@ def get_ig_api_headers(filepath: str = None, use_web: bool = False) -> dict:
     return base
 
 
+_user_id_cache: dict = {}
+
+
+async def _fetch_with_retry(client, url: str, headers: dict, max_retries: int = 3):
+    """Fetch with retry + backoff for 429 rate limits"""
+    for attempt in range(max_retries):
+        resp = await client.get(url, headers=headers)
+        if resp.status_code == 429:
+            wait = (attempt + 1) * 5
+            print(f"[WARN] HTTP 429 rate-limited, menunggu {wait}s...")
+            await asyncio.sleep(wait)
+            continue
+        return resp
+    return resp
+
+
 async def get_instagram_user_id(username: str) -> str:
     """Get Instagram user ID from username via internal API"""
+    if username in _user_id_cache:
+        return _user_id_cache[username]
+
     url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
     headers = get_ig_api_headers()
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await _fetch_with_retry(client, url, headers)
         if resp.status_code != 200:
             raise Exception(f"Gagal ambil user info: HTTP {resp.status_code}")
         try:
@@ -119,7 +139,9 @@ async def get_instagram_user_id(username: str) -> str:
         user = data.get("data", {}).get("user")
         if not user:
             raise Exception(f"User tidak ditemukan. Raw response top-level keys: {list(data.keys())}")
-        return str(user["id"])
+        uid = str(user["id"])
+        _user_id_cache[username] = uid
+        return uid
 
 
 def _parse_story_item(item: dict, idx: str, force_video: bool = None):
@@ -178,7 +200,7 @@ async def extract_stories_direct(username: str) -> dict:
 
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.get(ep_url, headers=headers)
+                resp = await _fetch_with_retry(client, ep_url, headers)
                 print(f"[DEBUG] {host} (web_headers={use_web}) status: {resp.status_code}")
 
                 if resp.status_code != 200:
@@ -197,7 +219,8 @@ async def extract_stories_direct(username: str) -> dict:
                         all_items_raw = batch
         except Exception as e:
             print(f"[WARN] {host} gagal: {e}")
-            continue
+        finally:
+            await asyncio.sleep(1.5)
 
     if not all_items_raw:
         raise HTTPException(status_code=404, detail="Tidak ada story ditemukan.")
@@ -465,7 +488,6 @@ async def debug_story(username: str = Query(..., description="Instagram username
         results = {}
         combos = [
             ("i.instagram.com", False),
-            ("i.instagram.com", True),
             ("www.instagram.com", True),
         ]
 
@@ -476,11 +498,13 @@ async def debug_story(username: str = Query(..., description="Instagram username
 
             try:
                 async with httpx.AsyncClient(timeout=20.0) as client:
-                    resp = await client.get(ep_url, headers=headers)
+                    resp = await _fetch_with_retry(client, ep_url, headers)
                     if resp.status_code != 200:
                         results[name] = {"status": resp.status_code, "error": resp.text[:200]}
+                        await asyncio.sleep(1.5)
                         continue
                     data = resp.json()
+                    await asyncio.sleep(1.5)
 
                 reel = data.get("reel") or data.get("reels", {}).get(user_id) or {}
                 items_raw = reel.get("items", [])
