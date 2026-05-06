@@ -1,7 +1,6 @@
 import os
 import base64
 import re
-import json
 import yt_dlp
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -21,10 +20,6 @@ app.add_middleware(
 
 COOKIE_FILE = os.environ.get("COOKIE_FILE", "instagram_cookies.txt")
 
-# Simple in-memory cache for username -> user_id
-import time as _time
-_user_id_cache: dict[str, tuple[str, float]] = {}  # username -> (user_id, timestamp)
-
 @app.on_event("startup")
 async def startup():
     cookies_b64 = os.environ.get("INSTAGRAM_COOKIES_B64", "")
@@ -43,220 +38,6 @@ BROWSER_HEADERS = {
     "Accept": "*/*",
 }
 
-IG_API_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "X-IG-App-ID": "9366197433924594",
-    "X-ASBD-ID": "198387",
-    "X-IG-WWW-Claim": "0",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-
-def parse_netscape_cookies() -> dict:
-    """Parse Netscape cookie file into a dict of {name: value}"""
-    cookies = {}
-    try:
-        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    cookies[parts[5]] = parts[6]
-    except Exception as e:
-        print(f"Cookie parse error: {e}")
-    return cookies
-
-
-def get_cookie_header() -> str:
-    c = parse_netscape_cookies()
-    return f"sessionid={c.get('sessionid', '')}; csrftoken={c.get('csrftoken', '')}; ds_user_id={c.get('ds_user_id', '')}"
-
-
-def extract_username(url: str) -> str:
-    match = re.search(r"instagram\.com/stories/([\w.]+)", url)
-    if match:
-        return match.group(1)
-    match = re.search(r"instagram\.com/stories/highlights/(\d+)", url)
-    if match:
-        return ""  # highlight uses numeric ID
-    return ""
-
-
-async def get_user_id(username: str, client: httpx.AsyncClient, cookie_header: str) -> Optional[str]:
-    """Get Instagram numeric user ID from profile page HTML (avoids rate-limited API)"""
-    # Check cache (5 min TTL)
-    if username in _user_id_cache:
-        uid, ts = _user_id_cache[username]
-        if _time.time() - ts < 300:
-            print(f"[DEBUG] cache hit: {username} -> {uid}")
-            return uid
-
-    headers = {**IG_API_HEADERS, "Cookie": cookie_header}
-
-    # Try getting user ID from profile page JSON-LD
-    for attempt in range(3):
-        try:
-            resp = await client.get(
-                f"https://www.instagram.com/{username}/",
-                headers=headers,
-                follow_redirects=True,
-            )
-            status = resp.status_code
-            print(f"[DEBUG] profile page status={status} attempt={attempt+1}")
-
-            if status == 429:
-                await _asleep((attempt + 1) * 5)
-                continue
-
-            if status != 200:
-                continue
-
-            html = resp.text
-
-            # Method 1: JSON-LD identifier
-            m = re.search(r'"identifier"\s*:\s*"(\d+)"', html)
-            if m:
-                uid = m.group(1)
-                _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} from identifier")
-                return uid
-
-            # Method 2: profilePage_USERID pattern
-            m = re.search(r'"profilePage_(\d+)"', html)
-            if m:
-                uid = m.group(1)
-                _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} from profilePage_")
-                return uid
-
-            # Method 3: id near username in embedded JSON
-            m = re.search(r'"username"\s*:\s*"' + re.escape(username) + r'"[^}]*"id"\s*:\s*"(\d+)"', html)
-            if m:
-                uid = m.group(1)
-                _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} from username+id")
-                return uid
-
-            # Method 4: "pk":"USERID" near username
-            m = re.search(r'"username"\s*:\s*"' + re.escape(username) + r'"[^}]*"pk"\s*:\s*"?(\d+)"?', html)
-            if m:
-                uid = m.group(1)
-                _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} from username+pk")
-                return uid
-
-            # Method 5: generic "id":"USERID" that looks like Instagram user ID (8+ digits)
-            for m in re.finditer(r'"id"\s*:\s*"(\d{8,})"', html):
-                uid = m.group(1)
-                # Verify this ID is near the target username
-                start = max(0, m.start() - 500)
-                end = min(len(html), m.end() + 500)
-                context = html[start:end]
-                if username in context:
-                    _user_id_cache[username] = (uid, _time.time())
-                    print(f"[DEBUG] got user_id={uid} from id near username")
-                    return uid
-
-            # Debug: dump sample around username mentions
-            for m in re.finditer(re.escape(username), html):
-                start = max(0, m.start() - 200)
-                end = min(len(html), m.end() + 200)
-                print(f"[DEBUG] context near username: ...{html[start:end]}...")
-                break  # just first match
-
-            print(f"[DEBUG] user_id not found in HTML (len={len(html)})")
-
-        except Exception as e:
-            print(f"get_user_id error: {e}")
-            if attempt < 2:
-                await _asleep(2)
-
-    return None
-
-
-async def _asleep(seconds: float):
-    import asyncio
-    await asyncio.sleep(seconds)
-
-
-async def extract_stories_direct(url: str) -> dict:
-    """Call Instagram's reels_media API directly to get ALL stories"""
-    username = extract_username(url)
-    if not username:
-        raise HTTPException(status_code=400, detail="Username tidak ditemukan di URL")
-
-    cookie_header = get_cookie_header()
-    headers = {**IG_API_HEADERS, "Cookie": cookie_header}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # Step 1: Get user ID
-        user_id = await get_user_id(username, client, cookie_header)
-        if not user_id:
-            raise HTTPException(status_code=400, detail="Gagal mendapatkan user ID. Pastikan cookies valid.")
-
-        print(f"[DEBUG] username={username}, user_id={user_id}")
-
-        # Step 2: Get all stories via reels_media API (with retry)
-        for attempt in range(3):
-            resp = await client.get(
-                f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
-                headers=headers,
-            )
-            if resp.status_code == 429:
-                wait = (attempt + 1) * 5
-                print(f"[DEBUG] reels_media rate limited, waiting {wait}s...")
-                await _asleep(wait)
-                continue
-            break
-
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Instagram API error ({resp.status_code}): {resp.text[:200]}",
-            )
-
-        data = resp.json()
-        reels = data.get("reels", {})
-        reel = reels.get(user_id, {})
-        items_raw = reel.get("items", [])
-
-        print(f"[DEBUG] direct API: got {len(items_raw)} story items")
-
-        items = []
-        for item in items_raw:
-            media_type = item.get("media_type", 1)  # 1=photo, 2=video
-            is_video = media_type == 2
-
-            if is_video:
-                video_versions = item.get("video_versions", [])
-                url = video_versions[0]["url"] if video_versions else ""
-                thumbnail = item.get("image_versions2", {}).get("candidates", [{}])[0].get("url", "")
-            else:
-                image_versions = item.get("image_versions2", {}).get("candidates", [])
-                url = image_versions[0]["url"] if image_versions else ""
-                thumbnail = url
-
-            items.append({
-                "type": "video" if is_video else "photo",
-                "url": url,
-                "thumbnail": thumbnail,
-            })
-
-        if not items:
-            raise HTTPException(status_code=404, detail="Tidak ada story ditemukan. Mungkin sudah expired.")
-
-        return {
-            "type": "carousel",
-            "items": items,
-            "description": f"Story by {username}",
-            "author": username,
-        }
-
-
-# ===== yt-dlp fallback (for non-story content) =====
 
 def clean_story_url(url: str) -> str:
     match = re.match(
@@ -267,7 +48,80 @@ def clean_story_url(url: str) -> str:
     return url
 
 
-def extract_info(url: str) -> dict:
+def extract_stories(url: str) -> dict:
+    """Extract Instagram stories using yt-dlp with all available stories"""
+    ydl_opts = {
+        "quiet": False,
+        "no_warnings": False,
+        "extract_flat": False,
+        "noplaylist": False,
+        "playlist_items": "1-200",
+        "cookiefile": COOKIE_FILE,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return parse_story_response(info)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Gagal memproses URL: {str(e)}")
+
+
+def parse_story_response(info: dict) -> dict:
+    entries = info.get("entries")
+    playlist_count = info.get("playlist_count", 0)
+    print(f"[DEBUG] yt-dlp: playlist_count={playlist_count}, entries={len(entries) if entries else 0}")
+
+    if not entries or len(entries) == 0:
+        raise HTTPException(status_code=404, detail="Tidak ada story ditemukan.")
+
+    items = []
+    for i, entry in enumerate(entries):
+        url = entry.get("url", "")
+        thumb = entry.get("thumbnail", "")
+
+        # Detect video vs photo
+        is_video = False
+        if entry.get("vcodec") and entry["vcodec"] != "none":
+            is_video = True
+        elif entry.get("duration"):
+            is_video = True
+        elif ".mp4" in url.lower():
+            is_video = True
+
+        items.append({
+            "type": "video" if is_video else "photo",
+            "url": url,
+            "thumbnail": thumb,
+        })
+        print(f"[DEBUG]   item[{i}]: {'video' if is_video else 'photo'}, url={url[:80]}...")
+
+    username = info.get("uploader") or info.get("channel") or ""
+
+    return {
+        "type": "carousel",
+        "items": items,
+        "description": info.get("title") or f"Story by {username}",
+        "author": username,
+    }
+
+
+# ===== Routes =====
+
+@app.get("/instagram/story")
+async def get_story(url: str = Query(..., description="Instagram story URL")):
+    clean_url = clean_story_url(url)
+    print(f"[DEBUG] story request: {url} -> {clean_url}")
+    try:
+        return JSONResponse(extract_stories(clean_url))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/instagram/highlight")
+async def get_highlight(url: str = Query(..., description="Instagram highlight URL")):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -277,102 +131,24 @@ def extract_info(url: str) -> dict:
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Gagal memproses URL: {str(e)}"
-        )
+            info = ydl.extract_info(url, download=False)
 
-
-def is_video_media(entry: dict) -> bool:
-    if entry.get("vcodec") and entry["vcodec"] != "none":
-        return True
-    if entry.get("acodec") and entry["acodec"] != "none":
-        return True
-    ext = entry.get("ext", "")
-    if ext in ("mp4", "webm", "mov"):
-        return True
-    if entry.get("duration"):
-        return True
-    url = entry.get("url", "")
-    if ".mp4" in url or "video" in url.lower():
-        return True
-    return False
-
-
-def get_media_url(entry: dict) -> str:
-    url = entry.get("url", "")
-    if url and ("cdninstagram" in url or "fbcdn" in url):
-        return url
-    if url and url.startswith("http"):
-        return url
-    return entry.get("webpage_url", "")
-
-
-def parse_response(info: dict) -> dict:
-    entries = info.get("entries")
-    if entries:
+        entries = info.get("entries", [])
         items = []
         for entry in entries:
-            video = is_video_media(entry)
+            is_video = entry.get("vcodec") and entry["vcodec"] != "none"
             items.append({
-                "type": "video" if video else "photo",
-                "url": get_media_url(entry),
+                "type": "video" if is_video else "photo",
+                "url": entry.get("url", ""),
                 "thumbnail": entry.get("thumbnail", ""),
             })
-        result = {
+
+        return JSONResponse({
             "type": "carousel",
             "items": items,
-            "description": info.get("title") or info.get("description", ""),
-            "author": info.get("uploader") or info.get("channel", ""),
-        }
-        if info.get("title"):
-            result["title"] = info.get("title")
-        return result
-
-    video = is_video_media(info)
-    result = {
-        "type": "video" if video else "photo",
-        "url": get_media_url(info),
-        "thumbnail": info.get("thumbnail", ""),
-        "description": info.get("description") or info.get("title", ""),
-        "author": info.get("uploader") or info.get("channel", ""),
-    }
-    if info.get("title"):
-        result["title"] = info.get("title")
-    return result
-
-
-# ===== Routes =====
-
-@app.get("/instagram/story")
-async def get_story(url: str = Query(..., description="Instagram story URL")):
-    try:
-        # Try direct API first (more reliable, gets ALL stories)
-        return JSONResponse(await extract_stories_direct(url))
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Direct API failed, falling back to yt-dlp: {e}")
-        # Fallback to yt-dlp
-        try:
-            clean_url = clean_story_url(url)
-            info = extract_info(clean_url)
-            return JSONResponse(parse_response(info))
-        except HTTPException:
-            raise
-        except Exception as e2:
-            raise HTTPException(status_code=500, detail=str(e2))
-
-
-@app.get("/instagram/highlight")
-async def get_highlight(url: str = Query(..., description="Instagram highlight URL")):
-    try:
-        clean_url = clean_story_url(url)
-        info = extract_info(clean_url)
-        return JSONResponse(parse_response(info))
-    except HTTPException:
-        raise
+            "description": info.get("title", ""),
+            "author": info.get("uploader", ""),
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
