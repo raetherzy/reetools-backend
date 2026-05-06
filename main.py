@@ -86,7 +86,7 @@ def extract_username(url: str) -> str:
 
 
 async def get_user_id(username: str, client: httpx.AsyncClient, cookie_header: str) -> Optional[str]:
-    """Get Instagram numeric user ID from username (with cache + retry)"""
+    """Get Instagram numeric user ID from profile page HTML (avoids rate-limited API)"""
     # Check cache (5 min TTL)
     if username in _user_id_cache:
         uid, ts = _user_id_cache[username]
@@ -96,40 +96,56 @@ async def get_user_id(username: str, client: httpx.AsyncClient, cookie_header: s
 
     headers = {**IG_API_HEADERS, "Cookie": cookie_header}
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    # Try getting user ID from profile page JSON-LD
+    for attempt in range(3):
         try:
             resp = await client.get(
-                f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+                f"https://www.instagram.com/{username}/",
                 headers=headers,
+                follow_redirects=True,
             )
             status = resp.status_code
-            print(f"[DEBUG] get_user_id status={status} attempt={attempt+1}")
+            print(f"[DEBUG] profile page status={status} attempt={attempt+1}")
 
             if status == 429:
-                wait = (attempt + 1) * 5
-                print(f"[DEBUG] rate limited, waiting {wait}s...")
-                await _asleep(wait)
+                await _asleep((attempt + 1) * 5)
                 continue
 
             if status != 200:
-                print(f"[DEBUG] get_user_id body: {resp.text[:300]}")
-                return None
+                continue
 
-            data = resp.json()
-            user = data.get("data", {}).get("user", {})
-            uid = str(user.get("pk") or user.get("id", ""))
-            if uid:
+            html = resp.text
+
+            # Method 1: JSON-LD identifier
+            m = re.search(r'"identifier"\s*:\s*"(\d+)"', html)
+            if m:
+                uid = m.group(1)
                 _user_id_cache[username] = (uid, _time.time())
-                print(f"[DEBUG] got user_id={uid} (cached)")
-            return uid or None
+                print(f"[DEBUG] got user_id={uid} from JSON-LD (cached)")
+                return uid
+
+            # Method 2: window.__INITIAL_STATE__ or window._sharedData
+            m = re.search(r'"profilePage_(\d+)"', html)
+            if m:
+                uid = m.group(1)
+                _user_id_cache[username] = (uid, _time.time())
+                print(f"[DEBUG] got user_id={uid} from profilePage_ (cached)")
+                return uid
+
+            # Method 3: props.id in embedded data
+            m = re.search(r'"props"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)"', html)
+            if m:
+                uid = m.group(1)
+                _user_id_cache[username] = (uid, _time.time())
+                print(f"[DEBUG] got user_id={uid} from props.id (cached)")
+                return uid
+
+            print(f"[DEBUG] user_id not found in HTML (len={len(html)})")
 
         except Exception as e:
             print(f"get_user_id error: {e}")
-            if attempt < max_retries - 1:
+            if attempt < 2:
                 await _asleep(2)
-            else:
-                return None
 
     return None
 
