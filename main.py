@@ -44,6 +44,15 @@ IG_APP_HEADERS = {
     "X-IG-App-ID": "936619743392459",
 }
 
+IG_WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-IG-App-ID": "936619743392459",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.instagram.com/",
+}
+
 
 def parse_netscape_cookies(filepath: str) -> dict:
     """Parse Netscape cookie file into dict of {name: value}"""
@@ -79,7 +88,7 @@ def parse_netscape_cookies(filepath: str) -> dict:
     return cookies
 
 
-def get_ig_api_headers(filepath: str = None) -> dict:
+def get_ig_api_headers(filepath: str = None, use_web: bool = False) -> dict:
     """Build headers for Instagram internal API requests"""
     if filepath is None:
         filepath = COOKIE_FILE
@@ -89,10 +98,10 @@ def get_ig_api_headers(filepath: str = None) -> dict:
     ds_user_id = c.get("ds_user_id", "")
 
     cookie_str = f"sessionid={sessionid}; csrftoken={csrftoken}; ds_user_id={ds_user_id}"
-    headers = dict(IG_APP_HEADERS)
-    headers["X-CSRFToken"] = csrftoken
-    headers["Cookie"] = cookie_str
-    return headers
+    base = dict(IG_WEB_HEADERS if use_web else IG_APP_HEADERS)
+    base["X-CSRFToken"] = csrftoken
+    base["Cookie"] = cookie_str
+    return base
 
 
 async def get_instagram_user_id(username: str) -> str:
@@ -110,74 +119,110 @@ async def get_instagram_user_id(username: str) -> str:
         return str(user["id"])
 
 
+def _parse_story_item(item: dict, idx: str, force_video: bool = None) -> dict | None:
+    """Parse satu story item jadi dict {type, url, thumbnail}"""
+    media_type = item.get("media_type", 1)
+    video_versions = item.get("video_versions", [])
+    image_candidates = item.get("image_versions2", {}).get("candidates", [])
+
+    if force_video is not None:
+        is_video = force_video
+    else:
+        is_video = media_type in (2, 3) or bool(video_versions)
+
+    if is_video and video_versions:
+        media_url = video_versions[0].get("url", "")
+    elif image_candidates:
+        media_url = image_candidates[0].get("url", "")
+    else:
+        # fallback: cek url langsung
+        media_url = item.get("url", "")
+        if not media_url or not media_url.startswith("http"):
+            print(f"[WARN] item[{idx}] tidak punya URL sama sekali, skip")
+            return None
+
+    if not media_url or not media_url.startswith("http"):
+        print(f"[WARN] item[{idx}] URL tidak valid: {str(media_url)[:60]}")
+        return None
+
+    thumb = ""
+    if image_candidates:
+        thumb = image_candidates[0].get("url", "")
+
+    print(f"[DEBUG] parsed item[{idx}]: {'video' if is_video else 'photo'}, url={media_url[:80]}")
+
+    return {
+        "type": "video" if is_video else "photo",
+        "url": media_url,
+        "thumbnail": thumb,
+    }
+
+
 async def extract_stories_direct(username: str) -> dict:
     """Extract ALL stories using Instagram internal API directly"""
-    headers = get_ig_api_headers()
     user_id = await get_instagram_user_id(username)
 
-    url = f"https://i.instagram.com/api/v1/feed/user/{user_id}/story/"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(url, headers=headers)
-        if resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="Tidak ada story ditemukan.")
-        if resp.status_code != 200:
-            raise Exception(f"Gagal ambil story: HTTP {resp.status_code}")
-        data = resp.json()
+    all_items_raw = []
+    combos = [
+        ("i.instagram.com", False),
+        ("i.instagram.com", True),
+        ("www.instagram.com", True),
+    ]
 
-    reel = data.get("reel") or data.get("reels", {}).get(user_id)
-    if not reel:
+    for host, use_web in combos:
+        headers = get_ig_api_headers(use_web=use_web)
+        ep_url = f"https://{host}/api/v1/feed/user/{user_id}/story/"
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(ep_url, headers=headers)
+                print(f"[DEBUG] {host} (web_headers={use_web}) status: {resp.status_code}")
+
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+
+                reel = data.get("reel") or data.get("reels", {}).get(user_id)
+                if reel:
+                    batch = reel.get("items", [])
+                    print(f"[INFO] {host}: {len(batch)} items")
+                    if len(batch) > len(all_items_raw):
+                        all_items_raw = batch
+        except Exception as e:
+            print(f"[WARN] {host} gagal: {e}")
+            continue
+
+    if not all_items_raw:
         raise HTTPException(status_code=404, detail="Tidak ada story ditemukan.")
 
-    items_raw = reel.get("items", [])
-    print(f"[INFO] Direct API: {len(items_raw)} story items dari Instagram")
+    print(f"[INFO] Total raw story items dari semua endpoint: {len(all_items_raw)}")
+
+    for i, item in enumerate(all_items_raw):
+        print(f"[DEBUG] raw item[{i}]: media_type={item.get('media_type')}, id={item.get('pk')}, taken_at={item.get('taken_at')}")
 
     items = []
-    for i, item in enumerate(items_raw):
+    for i, item in enumerate(all_items_raw):
         media_type = item.get("media_type", 1)
-        is_video = media_type == 2
-        entries = []
 
         if media_type == 8:
             subs = item.get("carousel_media", [])
-            for sub in subs:
-                entries.append({
-                    "is_video": sub.get("media_type") == 2,
-                    "images": sub.get("image_versions2", {}).get("candidates", []),
-                    "videos": sub.get("video_versions", []),
-                })
+            for ei, sub in enumerate(subs):
+                parsed = _parse_story_item(sub, f"{i}.{ei}")
+                if parsed:
+                    items.append(parsed)
+        elif media_type in (2, 3):
+            parsed = _parse_story_item(item, str(i), force_video=True)
+            if parsed:
+                items.append(parsed)
+        elif media_type == 1:
+            parsed = _parse_story_item(item, str(i), force_video=False)
+            if parsed:
+                items.append(parsed)
         else:
-            entries.append({
-                "is_video": is_video,
-                "images": item.get("image_versions2", {}).get("candidates", []),
-                "videos": item.get("video_versions", []),
-            })
-
-        for ei, entry in enumerate(entries):
-            if entry["is_video"]:
-                videos = entry["videos"]
-                url = videos[0]["url"] if videos else ""
-            else:
-                images = entry["images"]
-                url = images[0]["url"] if images else ""
-
-            if not url or not url.startswith("http"):
-                idx = f"{i}.{ei}" if len(entries) > 1 else str(i)
-                print(f"[WARN] Direct API item[{idx}] URL tidak valid, skip")
-                continue
-
-            thumb = ""
-            if entry["is_video"] and images:
-                thumb = images[0]["url"]
-            elif not entry["is_video"]:
-                thumb = url
-
-            items.append({
-                "type": "video" if entry["is_video"] else "photo",
-                "url": url,
-                "thumbnail": thumb,
-            })
-            idx = f"{i}.{ei}" if len(entries) > 1 else str(i)
-            print(f"[DEBUG]   item[{idx}]: {'video' if entry['is_video'] else 'photo'}, url={url[:80]}...")
+            print(f"[WARN] item[{i}] media_type={media_type} tidak dikenal, coba parse anyway")
+            parsed = _parse_story_item(item, str(i))
+            if parsed:
+                items.append(parsed)
 
     if not items:
         raise HTTPException(status_code=404, detail="Semua entry tidak valid.")
@@ -402,6 +447,62 @@ async def get_highlight(url: str = Query(..., description="Instagram highlight U
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/instagram/story/debug")
+async def debug_story(username: str = Query(..., description="Instagram username")):
+    """Endpoint debug — lihat raw data dari Instagram API (semua host)"""
+    user_id = await get_instagram_user_id(username)
+
+    results = {}
+    combos = [
+        ("i.instagram.com", False),
+        ("i.instagram.com", True),
+        ("www.instagram.com", True),
+    ]
+
+    for host, use_web in combos:
+        name = f"{host}_{'web' if use_web else 'app'}"
+        headers = get_ig_api_headers(use_web=use_web)
+        ep_url = f"https://{host}/api/v1/feed/user/{user_id}/story/"
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(ep_url, headers=headers)
+                data = resp.json()
+
+            reel = data.get("reel") or data.get("reels", {}).get(user_id) or {}
+            items_raw = reel.get("items", [])
+
+            summary = []
+            for i, item in enumerate(items_raw):
+                video_versions = item.get("video_versions", [])
+                images = item.get("image_versions2", {}).get("candidates", [])
+                carousel = item.get("carousel_media", [])
+
+                summary.append({
+                    "index": i,
+                    "pk": item.get("pk"),
+                    "id": item.get("id"),
+                    "media_type": item.get("media_type"),
+                    "has_video_versions": len(video_versions) > 0,
+                    "has_image_versions": len(images) > 0,
+                    "has_carousel_media": len(carousel) > 0,
+                    "taken_at": item.get("taken_at"),
+                })
+
+            results[name] = {
+                "status": resp.status_code,
+                "total_raw_items": len(items_raw),
+                "items": summary,
+            }
+        except Exception as e:
+            results[name] = {"error": str(e)}
+
+    return {
+        "user_id": user_id,
+        "endpoints": results,
+    }
 
 
 @app.get("/instagram/stream")
