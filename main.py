@@ -49,22 +49,73 @@ def clean_story_url(url: str) -> str:
 
 
 def extract_stories(url: str) -> dict:
-    """Extract Instagram stories using yt-dlp with all available stories"""
-    ydl_opts = {
-        "quiet": False,
-        "no_warnings": False,
-        "extract_flat": False,
-        "noplaylist": False,
-        "playlist_items": "1-200",
-        "cookiefile": COOKIE_FILE,
-    }
+    """Extract Instagram stories using yt-dlp with fallback strategies"""
+    strategies = [
+        {
+            "extract_flat": "in_playlist",
+            "ignoreerrors": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "sleep_interval": 1,
+            "max_sleep_interval": 3,
+        },
+        {
+            "extract_flat": False,
+            "ignoreerrors": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "sleep_interval": 2,
+            "max_sleep_interval": 5,
+        }
+    ]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return parse_story_response(info)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Gagal memproses URL: {str(e)}")
+    last_result = None
+    for i, extra_opts in enumerate(strategies):
+        ydl_opts = {
+            "quiet": False,
+            "no_warnings": False,
+            "noplaylist": False,
+            "cookiefile": COOKIE_FILE,
+            **extra_opts
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+                if info.get("entries"):
+                    resolved_entries = []
+                    for entry in info["entries"]:
+                        if entry.get("url") and entry["url"].startswith("http"):
+                            resolved_entries.append(entry)
+                        else:
+                            entry_url = entry.get("webpage_url") or entry.get("url", "")
+                            if entry_url:
+                                try:
+                                    resolved = ydl.extract_info(entry_url, download=False)
+                                    resolved_entries.append(resolved)
+                                except Exception as e:
+                                    print(f"[WARN] Strategi {i+1}, gagal resolve entry: {e}")
+                                    continue
+
+                    info["entries"] = resolved_entries
+
+                result = parse_story_response(info)
+                print(f"[INFO] Strategi {i+1} berhasil: {len(result['items'])} item")
+
+                if last_result is None or len(result["items"]) > len(last_result["items"]):
+                    last_result = result
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[WARN] Strategi {i+1} gagal: {e}")
+            continue
+
+    if last_result:
+        return last_result
+
+    raise HTTPException(status_code=400, detail="Gagal memproses semua strategi")
 
 
 def parse_story_response(info: dict) -> dict:
@@ -78,9 +129,13 @@ def parse_story_response(info: dict) -> dict:
     items = []
     for i, entry in enumerate(entries):
         url = entry.get("url", "")
+
+        if not url or not url.startswith("http"):
+            print(f"[WARN] entry[{i}] dilewati karena URL tidak valid: {str(url)[:50]}")
+            continue
+
         thumb = entry.get("thumbnail", "")
 
-        # Detect video vs photo
         is_video = False
         if entry.get("vcodec") and entry["vcodec"] != "none":
             is_video = True
@@ -95,6 +150,9 @@ def parse_story_response(info: dict) -> dict:
             "thumbnail": thumb,
         })
         print(f"[DEBUG]   item[{i}]: {'video' if is_video else 'photo'}, url={url[:80]}...")
+
+    if not items:
+        raise HTTPException(status_code=404, detail="Semua entry tidak valid.")
 
     username = info.get("uploader") or info.get("channel") or ""
 
@@ -125,21 +183,45 @@ async def get_highlight(url: str = Query(..., description="Instagram highlight U
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": False,
+        "extract_flat": "in_playlist",
         "noplaylist": False,
         "cookiefile": COOKIE_FILE,
+        "ignoreerrors": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "sleep_interval": 1,
+        "max_sleep_interval": 3,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
+            if info.get("entries"):
+                resolved_entries = []
+                for entry in info["entries"]:
+                    if entry.get("url") and entry["url"].startswith("http"):
+                        resolved_entries.append(entry)
+                    else:
+                        entry_url = entry.get("webpage_url") or entry.get("url", "")
+                        if entry_url:
+                            try:
+                                resolved = ydl.extract_info(entry_url, download=False)
+                                resolved_entries.append(resolved)
+                            except Exception as e:
+                                print(f"[WARN] Highlight, gagal resolve entry: {e}")
+                                continue
+                info["entries"] = resolved_entries
+
         entries = info.get("entries", [])
         items = []
         for entry in entries:
+            url = entry.get("url", "")
+            if not url or not url.startswith("http"):
+                continue
             is_video = entry.get("vcodec") and entry["vcodec"] != "none"
             items.append({
                 "type": "video" if is_video else "photo",
-                "url": entry.get("url", ""),
+                "url": url,
                 "thumbnail": entry.get("thumbnail", ""),
             })
 
