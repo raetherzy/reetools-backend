@@ -112,14 +112,17 @@ async def get_instagram_user_id(username: str) -> str:
         resp = await client.get(url, headers=headers)
         if resp.status_code != 200:
             raise Exception(f"Gagal ambil user info: HTTP {resp.status_code}")
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            raise Exception(f"Response bukan JSON: {resp.text[:200]}")
         user = data.get("data", {}).get("user")
         if not user:
-            raise Exception("User tidak ditemukan")
+            raise Exception(f"User tidak ditemukan. Raw response top-level keys: {list(data.keys())}")
         return str(user["id"])
 
 
-def _parse_story_item(item: dict, idx: str, force_video: bool = None) -> dict | None:
+def _parse_story_item(item: dict, idx: str, force_video: bool = None):
     """Parse satu story item jadi dict {type, url, thumbnail}"""
     media_type = item.get("media_type", 1)
     video_versions = item.get("video_versions", [])
@@ -180,7 +183,11 @@ async def extract_stories_direct(username: str) -> dict:
 
                 if resp.status_code != 200:
                     continue
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception:
+                    print(f"[WARN] {host} response bukan JSON: {resp.text[:200]}")
+                    continue
 
                 reel = data.get("reel") or data.get("reels", {}).get(user_id)
                 if reel:
@@ -452,57 +459,66 @@ async def get_highlight(url: str = Query(..., description="Instagram highlight U
 @app.get("/instagram/story/debug")
 async def debug_story(username: str = Query(..., description="Instagram username")):
     """Endpoint debug — lihat raw data dari Instagram API (semua host)"""
-    user_id = await get_instagram_user_id(username)
+    try:
+        user_id = await get_instagram_user_id(username)
 
-    results = {}
-    combos = [
-        ("i.instagram.com", False),
-        ("i.instagram.com", True),
-        ("www.instagram.com", True),
-    ]
+        results = {}
+        combos = [
+            ("i.instagram.com", False),
+            ("i.instagram.com", True),
+            ("www.instagram.com", True),
+        ]
 
-    for host, use_web in combos:
-        name = f"{host}_{'web' if use_web else 'app'}"
-        headers = get_ig_api_headers(use_web=use_web)
-        ep_url = f"https://{host}/api/v1/feed/user/{user_id}/story/"
+        for host, use_web in combos:
+            name = f"{host}_{'web' if use_web else 'app'}"
+            headers = get_ig_api_headers(use_web=use_web)
+            ep_url = f"https://{host}/api/v1/feed/user/{user_id}/story/"
 
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.get(ep_url, headers=headers)
-                data = resp.json()
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    resp = await client.get(ep_url, headers=headers)
+                    if resp.status_code != 200:
+                        results[name] = {"status": resp.status_code, "error": resp.text[:200]}
+                        continue
+                    data = resp.json()
 
-            reel = data.get("reel") or data.get("reels", {}).get(user_id) or {}
-            items_raw = reel.get("items", [])
+                reel = data.get("reel") or data.get("reels", {}).get(user_id) or {}
+                items_raw = reel.get("items", [])
 
-            summary = []
-            for i, item in enumerate(items_raw):
-                video_versions = item.get("video_versions", [])
-                images = item.get("image_versions2", {}).get("candidates", [])
-                carousel = item.get("carousel_media", [])
+                summary = []
+                for i, item in enumerate(items_raw):
+                    video_versions = item.get("video_versions", [])
+                    images = item.get("image_versions2", {}).get("candidates", [])
+                    carousel = item.get("carousel_media", [])
 
-                summary.append({
-                    "index": i,
-                    "pk": item.get("pk"),
-                    "id": item.get("id"),
-                    "media_type": item.get("media_type"),
-                    "has_video_versions": len(video_versions) > 0,
-                    "has_image_versions": len(images) > 0,
-                    "has_carousel_media": len(carousel) > 0,
-                    "taken_at": item.get("taken_at"),
-                })
+                    summary.append({
+                        "index": i,
+                        "pk": item.get("pk"),
+                        "id": item.get("id"),
+                        "media_type": item.get("media_type"),
+                        "has_video_versions": len(video_versions) > 0,
+                        "has_image_versions": len(images) > 0,
+                        "has_carousel_media": len(carousel) > 0,
+                        "taken_at": item.get("taken_at"),
+                    })
 
-            results[name] = {
-                "status": resp.status_code,
-                "total_raw_items": len(items_raw),
-                "items": summary,
-            }
-        except Exception as e:
-            results[name] = {"error": str(e)}
+                results[name] = {
+                    "status": resp.status_code,
+                    "total_raw_items": len(items_raw),
+                    "items": summary,
+                }
+            except Exception as e:
+                results[name] = {"error": str(e)}
 
-    return {
-        "user_id": user_id,
-        "endpoints": results,
-    }
+        return {
+            "user_id": user_id,
+            "endpoints": results,
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Debug gagal: {str(e)}", "user_id": None, "endpoints": {}},
+            status_code=500,
+        )
 
 
 @app.get("/instagram/stream")
