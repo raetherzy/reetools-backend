@@ -43,6 +43,9 @@ BROWSER_HEADERS = {
 def parse_netscape_cookies(filepath: str) -> dict:
     """Parse Netscape cookie file into dict of {name: value}"""
     cookies = {}
+    if not filepath:
+        print("[WARN] Cookie filepath is None/empty")
+        return cookies
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
@@ -82,6 +85,8 @@ def build_cookie_string(filepath: str = None) -> str:
 
 
 def make_web_headers(filepath: str = None) -> dict:
+    if filepath is None:
+        filepath = COOKIE_FILE
     h = dict(BROWSER_HEADERS)
     h["Cookie"] = build_cookie_string(filepath)
     h["X-CSRFToken"] = parse_netscape_cookies(filepath).get("csrftoken", "")
