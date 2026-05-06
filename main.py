@@ -1,5 +1,6 @@
 import os
 import base64
+import re
 import yt_dlp
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -38,12 +39,24 @@ BROWSER_HEADERS = {
 }
 
 
+def clean_story_url(url: str) -> str:
+    # Convert specific story URL to base stories URL to get ALL stories
+    # From: /stories/username/123456789/
+    # To:   /stories/username/
+    match = re.match(
+        r"(https?://(?:www\.)?instagram\.com/stories/[\w.]+)/\d+", url
+    )
+    if match:
+        return match.group(1) + "/"
+    return url
+
 def extract_info(url: str) -> dict:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
         "noplaylist": False,
+        "playlist_items": "1-100",
         "cookiefile": COOKIE_FILE,
     }
 
@@ -128,7 +141,8 @@ def parse_response(info: dict) -> dict:
 @app.get("/instagram/story")
 async def get_story(url: str = Query(..., description="Instagram story URL")):
     try:
-        info = extract_info(url)
+        clean_url = clean_story_url(url)
+        info = extract_info(clean_url)
         return JSONResponse(parse_response(info))
     except HTTPException:
         raise
@@ -139,7 +153,8 @@ async def get_story(url: str = Query(..., description="Instagram story URL")):
 @app.get("/instagram/highlight")
 async def get_highlight(url: str = Query(..., description="Instagram highlight URL")):
     try:
-        info = extract_info(url)
+        clean_url = clean_story_url(url)
+        info = extract_info(clean_url)
         return JSONResponse(parse_response(info))
     except HTTPException:
         raise
