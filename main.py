@@ -81,18 +81,23 @@ def extract_username(url: str) -> str:
     return ""
 
 
-async def get_user_id(username: str, client: httpx.AsyncClient) -> Optional[str]:
+async def get_user_id(username: str, client: httpx.AsyncClient, cookie_header: str) -> Optional[str]:
     """Get Instagram numeric user ID from username"""
     try:
+        headers = {**IG_API_HEADERS, "Cookie": cookie_header}
         resp = await client.get(
             f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
-            headers=IG_API_HEADERS,
+            headers=headers,
         )
+        print(f"[DEBUG] get_user_id status={resp.status_code}")
         if resp.status_code != 200:
+            print(f"[DEBUG] get_user_id body: {resp.text[:300]}")
             return None
         data = resp.json()
         user = data.get("data", {}).get("user", {})
-        return str(user.get("pk") or user.get("id", ""))
+        uid = str(user.get("pk") or user.get("id", ""))
+        print(f"[DEBUG] got user_id={uid}")
+        return uid or None
     except Exception as e:
         print(f"get_user_id error: {e}")
         return None
@@ -109,7 +114,7 @@ async def extract_stories_direct(url: str) -> dict:
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         # Step 1: Get user ID
-        user_id = await get_user_id(username, client)
+        user_id = await get_user_id(username, client, cookie_header)
         if not user_id:
             raise HTTPException(status_code=400, detail="Gagal mendapatkan user ID. Pastikan cookies valid.")
 
